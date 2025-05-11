@@ -9,12 +9,12 @@
         "num_inference_steps": 50
     },
     "verifier_args": {
-        "name": "gemini", 
+        "name": "qwen", 
         "max_new_tokens": 800,
         "choice_of_metric": "overall_score"
     },
     "search_args": {
         "search_method": "random",
-        "search_rounds": 4
+        "search_rounds": 2
     }
 }

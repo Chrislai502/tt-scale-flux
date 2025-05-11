@@ -1,0 +1,27 @@
+install flashattention
+install datasets
+TypeError: prepare_latents() got an unexpected keyword argument 'negative_prompt'
+Cuda OOM.
+
+# Supported Metrics
+Supported values for the Gemini and Qwen verifiers are:
+
+"accuracy_to_prompt"
+"creativity_and_originality"
+"visual_quality_and_realism" 
+"consistency_and_cohesion"
+"emotional_or_thematic_resonance"
+"overall_score"
+
+python main.py --pipeline_config_path="configs/sdxl.json" --prompt="Photo of an athlete cat explaining it’s latest scandal at a press conference to journalists." --num_prompts=None
+
+# Using Flux Model to Generate Images
+python main.py --pipeline_config_path="configs/flux.1_dev.json" --prompt="Photo of an athlete cat explaining it’s latest scandal at a press conference to journalists." --num_prompts=None
+python eval_intermediate.py --pipeline_config_path="configs/flux_clip.json" --prompt="Photo of an athlete cat explaining it’s latest scandal at a press conference to journalists." --num_prompts=None
+python eval_intermediate.py --pipeline_config_path="configs/flux_clip.json" --prompt="Photorealistic image of parmesan and garlic having an argument with each other." --num_prompts=None
+
+# Allocate GPU Resources
+salloc -A mp309 -N 1 -C gpu -q interactive --gpus-per-node 1 -t  00:10:00
+
+# Setup the environment
+source setup_env.sh

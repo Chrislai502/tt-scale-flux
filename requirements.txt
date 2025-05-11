@@ -1,8 +1,11 @@
 torch>=2.5.1
-git+https://github.com/huggingface/diffusers.git
-git+https://github.com/huggingface/transformers.git@006d9249ec0270ff6c4d3840979d23fe94bdc763
+# diffusers
+transformers
 pydantic
 outlines
 accelerate
 protobuf
 sentencepiece
+
+clip @ git+https://github.com/openai/CLIP.git@dcba3cb2e2827b402d2701e7e1c7d9fed8a20ef1
+image-reward

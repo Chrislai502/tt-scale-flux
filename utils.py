@@ -125,6 +125,7 @@ def prepare_latents_for_flux(
     generator: torch.Generator,
     device: str,
     dtype: torch.dtype,
+    **kwargs,
 ) -> torch.Tensor:
     num_latent_channels = 16
     vae_scale_factor = 8

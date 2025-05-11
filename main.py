@@ -5,9 +5,18 @@ from PIL import Image
 import numpy as np
 import torch
 from diffusers import DiffusionPipeline
+from diffusers import StableDiffusionXLPipeline
 from tqdm.auto import tqdm
 import tempfile
 from diffusers.utils import export_to_video
+from dotenv import load_dotenv
+import subprocess
+
+subprocess.run(["bash", "setup_env.sh"])
+load_dotenv()
+
+HF_HOME = os.getenv("HF_HOME")
+print(f"Using HF_HOME: {HF_HOME}")
 
 from utils import (
     generate_neighbors,
@@ -48,6 +57,8 @@ def sample(
     choice_of_metric = verifier_args.get("choice_of_metric", None)
     verifier_to_use = verifier_args.get("name", "gemini")
     search_args = config.get("search_args", None)
+    export_args = config.get("export_args", {})  # Define export_args at function start
+
 
     images_for_prompt = []
     noises_used = []
@@ -65,32 +76,45 @@ def sample(
         extension_to_use = "mp4"
     elif "Wan" in pipe.__class__.__name__:
         extension_to_use = "mp4"
+        
+    # Process the noises in batches to maximize GPU efficiency
     for i in range(0, len(noise_items), batch_size_for_img_gen):
+        # Extract a batch of noise items
         batch = noise_items[i : i + batch_size_for_img_gen]
-        seeds_batch, noises_batch = zip(*batch)
+        seeds_batch, noises_batch = zip(*batch) # Separate seeds and noises
+        
+        # Create filenames for each output in the batch
+        # Format: prompt_i@search_round_s@seed.extension
         filenames_batch = [
             os.path.join(root_dir, f"{prompt_filename}_i@{search_round}_s@{seed}.{extension_to_use}")
             for seed in seeds_batch
         ]
 
+        # Manage GPU memory - move model to GPU if using low VRAM mode
+        # (except for the "gemini" verifier which may handle this differently)
         if use_low_gpu_vram and verifier_to_use != "gemini":
-            pipe = pipe.to("cuda:0")
+            pipe = pipe.to("cuda:0") # Move pipeline to GPU
         print(f"Generating images for batch with seeds: {list(seeds_batch)}.")
 
-        # Create a batched prompt list and stack the latents.
+        # Create a list of identical prompts (one for each noise in the batch)
         batched_prompts = [prompt] * len(noises_batch)
         batched_latents = torch.stack(noises_batch).squeeze(dim=1)
 
-        batch_result = pipe(prompt=batched_prompts, latents=batched_latents, **config["pipeline_call_args"])
+        # Generate images using the diffusion pipeline
+        # Pass the batched prompts, noise tensors, and additional arguments from config
+        batch_result = pipe(prompt=batched_prompts, latents=batched_latents, save_latent_images=os.path.join(root_dir, "latent_images"), **config["pipeline_call_args"])
+        
+        # Extract the generated images or video frames based on output type
         if hasattr(batch_result, "images"):
             batch_images = batch_result.images
         elif hasattr(batch_result, "frames"):
             batch_images = [vid for vid in batch_result.frames]
 
+        # If using low VRAM mode, move pipeline back to CPU to free up GPU memory
         if use_low_gpu_vram and verifier_to_use != "gemini":
             pipe = pipe.to("cpu")
 
-        # Collect the images and corresponding info.
+        # Collect all the generated outputs and their corresponding metadata
         for seed, noise, image, filename in zip(seeds_batch, noises_batch, batch_images, filenames_batch):
             images_for_prompt.append(image)
             noises_used.append(noise)
@@ -119,6 +143,8 @@ def sample(
                 verifier_inputs.append(verifier.prepare_inputs(images=frames, prompts=[prompt] * len(frames)))
 
     print("Scoring with the verifier.")
+    print(f"Verifier inputs: {verifier_inputs.keys()}")
+    print(f"Verifier inputs length: {len(verifier_inputs)}")
     outputs = verifier.score(inputs=verifier_inputs)
     for o in outputs:
         assert choice_of_metric in o, o.keys()
@@ -128,6 +154,7 @@ def sample(
     ), f"Expected len(outputs) to be same as len(images_for_prompt) but got {len(outputs)=} & {len(images_for_prompt)=}"
 
     results = []
+    print(outputs)
     for json_dict, seed_val, noise in zip(outputs, seeds_used, noises_used):
         # Merge verifier outputs with noise info.
         merged = {**json_dict, "noise": noise, "seed": seed_val}
@@ -220,26 +247,35 @@ def main():
     print(f"Using {len(prompts)} prompt(s).")
 
     # === Set up the image-generation pipeline ===
+    print("Loading pipeline...")
     torch_dtype = TORCH_DTYPE_MAP[config.pop("torch_dtype")]
     fp_kwargs = {"pretrained_model_name_or_path": pipeline_name, "torch_dtype": torch_dtype}
     if "Wan" in pipeline_name:
         # As per recommendations from https://huggingface.co/docs/diffusers/main/en/api/pipelines/wan.
         from diffusers import AutoencoderKLWan
 
-        vae = AutoencoderKLWan.from_pretrained(pipeline_name, subfolder="vae", torch_dtype=torch.float32)
+        vae = AutoencoderKLWan.from_pretrained(pipeline_name, subfolder="vae", torch_dtype=torch.float32, cache_dir=HF_HOME)
         fp_kwargs.update({"vae": vae})
-    pipe = DiffusionPipeline.from_pretrained(**fp_kwargs)
+    pipe = DiffusionPipeline.from_pretrained(**fp_kwargs, cache_dir=HF_HOME)
     if not config.get("use_low_gpu_vram", False):
         pipe = pipe.to("cuda:0")
     pipe.set_progress_bar_config(disable=True)
+    # print("The type of pipe used")
+    # print(pipe)
+    # print(pipe.scheduler)
+    # print(pipe.scheduler.timesteps)
+    # pipe.scheduler.set_timesteps(100)
+    print("Pipeline loaded.")
 
     # === Load verifier model ===
+    print("Loading verifier...")
     verifier_args = config["verifier_args"]
     verifier_cls = SUPPORTED_VERIFIERS.get(verifier_args["name"])
     if verifier_cls is None:
         raise ValueError("Verifier class evaluated to be `None`. Make sure the dependencies are installed properly.")
 
     verifier = verifier_cls(**verifier_args)
+    print("Verifier loaded.")
 
     # === Main loop: For each prompt and each search round ===
     pipeline_call_args = config["pipeline_call_args"].copy()

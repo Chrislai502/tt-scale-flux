@@ -3,8 +3,7 @@
     "torch_dtype": "fp16",
     "pipeline_call_args": {
         "height": 1024,
-        "width": 1024,
-        "negative_prompt": "bad quality, worse quality, degenerate quality" 
+        "width": 1024
     },
     "verifier_args": {
         "name": "qwen", 
@@ -13,6 +12,6 @@
     },
     "search_args": {
         "search_method": "random",
-        "search_rounds": 6
+        "search_rounds": 1
     }
 }

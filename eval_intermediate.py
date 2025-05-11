@@ -12,7 +12,7 @@ from diffusers.utils import export_to_video
 from dotenv import load_dotenv
 import subprocess
 import time
-from verifiers.image_reward import ImageRewardVerifier
+# from verifiers.image_reward import ImageRewardVerifier
 
 subprocess.run(["bash", "setup_env.sh"])
 load_dotenv()
@@ -112,13 +112,22 @@ def sample(
         # Pass the batched prompts, noise tensors, and additional arguments from config
         print("Generating images...")
         start_time = time.time()
-        batch_result = pipe(prompt=batched_prompts, latents=batched_latents, save_latent_images=save_intermediate_images_path, **config["pipeline_call_args"])
+        
+        # --- set up timing callback to record wall‐clock time at each diffusion step ---
+        step_times: dict[int, float] = {}
+        def timing_callback(pipeline, step: int, timestep, callback_kwargs):
+            # timestep is a torch scalar or int; normalize to Python int
+            t = int(timestep.item()) if hasattr(timestep, "item") else int(timestep)
+            step_times[t] = time.time() - start_time
+            return {}  # do not modify anything
+        
+        batch_result = pipe(prompt=batched_prompts, latents=batched_latents, callback_on_step_end=timing_callback, save_latent_images=save_intermediate_images_path, **config["pipeline_call_args"])
         end_time = time.time()
         print(f"Generated images in {end_time - start_time:.2f} seconds.")
         
         # Extract the intermediate scores using the verifier
         if extract_intermediate_scores:
-            score_output[i] = {}
+            # score_output[i] = {}
             image_files = [(f, float(f.split('.png')[0].split('_')[-1])) for f in os.listdir(save_intermediate_images_path) 
                 if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.tiff'))]
             # sort the iamge files by name
@@ -153,6 +162,7 @@ def sample(
                 # Process the batch
                 start_time = time.time()
                 if batch_images and isinstance(batch_images[0], Image.Image):
+                    # import ipdb; ipdb.set_trace()
                     verifier_inputs = verifier.prepare_inputs(images=batch_images, prompts=[prompt] * batch_size)
                     batch_outputs = verifier.score(inputs=verifier_inputs)
                 else:
@@ -166,9 +176,15 @@ def sample(
                 for t_, verifier_scores_output in zip(batch_timesteps, batch_outputs):
                     # Initialize nested dictionaries if they don't exist
                     if str(seed) not in score_output:
-                        score_output[str(seed)] = {}
+                        score_output[str(seed)] = {
+                            "round": search_round,
+                            "intermediates": {}
+                        }
                     
-                    score_output[str(seed)][str(t_)] = verifier_scores_output
+                    score_output[str(seed)]["intermediates"][str(t_)] = {
+                        **verifier_scores_output,
+                        "time_so_far": step_times.get(t_, None)
+                    }
                 
                 # Clean up memory by closing images after processing
                 for img in batch_images:
@@ -225,8 +241,21 @@ def sample(
 
     # Save the score outputs as a JSON file
     if extract_intermediate_scores:
-        with open(os.path.join(save_intermediate_images_path, "score_output.json"), "w") as f:
-            json.dump(score_output, f)
+        score_output_path = os.path.join(root_dir, "score_output.json")
+        if os.path.exists(score_output_path):
+            with open(score_output_path, 'r') as file:
+                existing_score_output_data = json.load(file)
+
+            existing_score_output_data.update(score_output)
+
+            with open(score_output_path, "w") as f:
+                json.dump(existing_score_output_data, f)
+                print(f"Saved round {search_round} scores")
+        else:
+            with open(score_output_path, "w") as f:
+                json.dump(score_output, f)
+                print(f"Saved round {search_round} scores")
+        
 
     # Prepare verifier inputs and perform inference.
     start_time = time.time()
