@@ -15,6 +15,7 @@
   },
   "search_args": {
       "search_method": "random",
-      "search_rounds": 4
+      "search_rounds": 4,
+      "early_stop_timestep": 800
   }
 }

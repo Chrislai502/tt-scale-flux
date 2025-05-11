@@ -47,7 +47,8 @@ def sample(
     topk: int,
     root_dir: str,
     config: dict,
-    extract_intermediate_scores: bool = True
+    extract_intermediate_scores: bool = True,
+    early_stop_timestep: int = None,
 ) -> dict:
     """
     For a given prompt, generate images using all provided noises in batches,
@@ -118,12 +119,18 @@ def sample(
         def timing_callback(pipeline, step: int, timestep, callback_kwargs):
             # timestep is a torch scalar or int; normalize to Python int
             t = int(timestep.item()) if hasattr(timestep, "item") else int(timestep)
-            step_times[t] = time.time() - start_time
+            step_times[t] = time.time() - start_time            
+            # early stopping
+            if early_stop_timestep is not None and t <= early_stop_timestep:
+                pipeline._interrupt = True
             return {}  # do not modify anything
         
         batch_result = pipe(prompt=batched_prompts, latents=batched_latents, callback_on_step_end=timing_callback, save_latent_images=save_intermediate_images_path, **config["pipeline_call_args"])
         end_time = time.time()
-        print(f"Generated images in {end_time - start_time:.2f} seconds.")
+        if (early_stop_timestep is not None) and (early_stop_timestep > 0):
+            print(f"Generated images in {end_time - start_time:.2f} seconds (stopped after timestep {early_stop_timestep}).")
+        else:
+            print(f"Generated images in {end_time - start_time:.2f} seconds.")
         
         # Extract the intermediate scores using the verifier
         if extract_intermediate_scores:
@@ -236,26 +243,7 @@ def sample(
             images_for_prompt.append(image)
             noises_used.append(noise)
             seeds_used.append(seed)
-            images_info.append((seed, noise, image, filename))
-
-
-    # Save the score outputs as a JSON file
-    if extract_intermediate_scores:
-        score_output_path = os.path.join(root_dir, "score_output.json")
-        if os.path.exists(score_output_path):
-            with open(score_output_path, 'r') as file:
-                existing_score_output_data = json.load(file)
-
-            existing_score_output_data.update(score_output)
-
-            with open(score_output_path, "w") as f:
-                json.dump(existing_score_output_data, f)
-                print(f"Saved round {search_round} scores")
-        else:
-            with open(score_output_path, "w") as f:
-                json.dump(score_output, f)
-                print(f"Saved round {search_round} scores")
-        
+            images_info.append((seed, noise, image, filename))        
 
     # Prepare verifier inputs and perform inference.
     start_time = time.time()
@@ -328,6 +316,111 @@ def sample(
         "best_img_path": best_img_path,
     }
 
+    if (early_stop_timestep is not None) and (early_stop_timestep > 0):
+        # for each seed in results, rewrite the scores at the last timestep in score_output
+        # for entry in results:
+        #     seed_key = str(entry["seed"])
+        #     # extract the scalar metric
+        #     metric_val = entry[choice_of_metric]
+        #     new_score = metric_val["score"] if isinstance(metric_val, dict) else metric_val
+
+        #     # grab that seed’s intermediates dict
+        #     intermediates = score_output.get(seed_key, {}).get("intermediates", {})
+        #     if not intermediates:
+        #         continue
+
+        #     # pick the largest timestep key
+        #     latest_t = str(min(int(t) for t in intermediates.keys()))
+
+        #     # overwrite the stored overall_score
+        #     score_output[seed_key]["intermediates"][latest_t]["overall_score"] = new_score
+        
+        # import ipdb; ipdb.set_trace()
+        # best_seed  = topk_scores[0]["seed"]
+        # best_noise = topk_scores[0]["noise"].to(pipe.device)  # move to correct device if needed
+
+        # find the best noise from the score_output
+        candidates = {
+            int(seed_key): seed_data
+            for seed_key, seed_data in score_output.items()
+            if seed_data.get("round") == search_round
+        }
+        best_seed = None
+        best_val = -float("inf")
+        for seed_int, seed_data in candidates.items():
+            # find the minimum timestep we recorded
+            ts_ints = [int(t) for t in seed_data["intermediates"].keys()]
+            if not ts_ints:
+                continue
+            last_t = min(ts_ints)
+            val = seed_data["intermediates"][str(last_t)]["overall_score"]
+            if val > best_val:
+                best_val = val
+                best_seed = seed_int
+
+        if best_seed is None:
+            raise RuntimeError(f"No valid seeds found in score_output for round {search_round}")
+
+        # grab the corresponding noise tensor from the original noise pool
+        best_noise = noises[best_seed].to(pipe.device)
+
+        print(f"Rolling out the best noise, which is seed {best_seed}.")
+
+        t_full_start = time.time()
+        full_out = pipe(
+            prompt=prompt,
+            latents=best_noise,
+            **config["pipeline_call_args"]
+        )
+        t_full = time.time() - t_full_start
+        print(f"Full rollout complete, took {t_full:.2f} seconds.")
+
+        full_img = full_out.images[0]
+        final_timestep = pipe.scheduler.timesteps[-1]
+        # save into the latent images folder
+        save_intermediate_images_path = os.path.join(root_dir, "latent_images", str(best_seed))
+
+        full_path = os.path.join(
+            save_intermediate_images_path, f"image_t_{final_timestep}.{extension_to_use}"
+        )
+        full_img.save(full_path)
+
+        # run verifier the final image
+        full_scores = verifier.score(
+            inputs=verifier.prepare_inputs(images=[full_img], prompts=[prompt])
+        )[0]
+        full_score = full_scores.get(choice_of_metric, None)
+
+        seed_key = str(best_seed)
+        # ensure the entry exists
+        if seed_key not in score_output:
+            score_output[seed_key] = {
+                "round": search_round,
+                "intermediates": {}
+            }
+        # write the final timestep entry
+        score_output[seed_key]["intermediates"][str(int(final_timestep))] = {
+            "overall_score": full_score,
+            "time_so_far":   t_full
+        }
+
+    # Save the score outputs as a JSON file
+    if extract_intermediate_scores:
+        score_output_path = os.path.join(root_dir, "score_output.json")
+        if os.path.exists(score_output_path):
+            with open(score_output_path, 'r') as file:
+                existing_score_output_data = json.load(file)
+
+            existing_score_output_data.update(score_output)
+
+            with open(score_output_path, "w") as f:
+                json.dump(existing_score_output_data, f)
+                print(f"Saved round {search_round} scores")
+        else:
+            with open(score_output_path, "w") as f:
+                json.dump(score_output, f)
+                print(f"Saved round {search_round} scores")
+
     # Check if the neighbors have any improvements (zero-order only).
     search_method = search_args.get("search_method", "random") if search_args else "random"
     if search_args and search_method == "zero-order":
@@ -359,6 +452,7 @@ def main():
     search_rounds = search_args["search_rounds"]
     search_method = search_args.get("search_method", "random")
     num_prompts = config["num_prompts"]
+    early_stop_timestep = search_args.get("early_stop_timestep", None)
 
     # === Create output directory ===
     current_datetime = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -489,6 +583,7 @@ def main():
                 topk=TOPK,
                 root_dir=output_dir,
                 config=config,
+                early_stop_timestep=early_stop_timestep,
             )
 
             if search_method == "zero-order":
